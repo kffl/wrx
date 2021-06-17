@@ -13,6 +13,9 @@ static struct config {
     bool     delay;
     bool     dynamic;
     bool     latency;
+    bool     histogram;
+    bool     timeseries;
+    bool     thread_timeseries;
     char    *host;
     char    *script;
     SSL_CTX *ctx;
@@ -21,6 +24,8 @@ static struct config {
 static struct {
     stats *latency;
     stats *requests;
+    uint64_t epochs;
+    uint64_t *req_count;
 } statistics;
 
 static struct sock sock = {
@@ -42,17 +47,22 @@ static void handler(int sig) {
 }
 
 static void usage() {
-    printf("Usage: wrk <options> <url>                            \n"
-           "  Options:                                            \n"
-           "    -c, --connections <N>  Connections to keep open   \n"
-           "    -d, --duration    <T>  Duration of test           \n"
-           "    -t, --threads     <N>  Number of threads to use   \n"
-           "                                                      \n"
-           "    -s, --script      <S>  Load Lua script file       \n"
-           "    -H, --header      <H>  Add header to request      \n"
-           "        --latency          Print latency statistics   \n"
-           "        --timeout     <T>  Socket/request timeout     \n"
-           "    -v, --version          Print version details      \n"
+    printf("Usage: wrx <options> <url>                             \n"
+           "  Options:                                             \n"
+           "    -c, --connections <N>    Connections to keep open   \n"
+           "    -d, --duration    <T>    Duration of test           \n"
+           "    -t, --threads     <N>    Number of threads to use   \n"
+           "                                                       \n"
+           "    -s, --script      <S>    Load Lua script file       \n"
+           "    -H, --header      <H>    Add header to request      \n"
+           "        --latency            Print latency statistics   \n"
+           "        --timeout     <T>    Socket/request timeout     \n"
+           "    -v, --version            Print version details      \n"
+           "        --histogram          Print latency histogram    \n"
+           "        --timeseries         Print req count time series\n"
+           "                             (summary)\n"
+           "        --thread-timeseries  Print req count time series\n"
+           "                             (for each thread)\n"
            "                                                      \n"
            "  Numeric arguments may include a SI unit (1k, 1M, 1G)\n"
            "  Time arguments may include a time unit (2s, 2m, 2h)\n");
@@ -92,6 +102,9 @@ int main(int argc, char **argv) {
     statistics.requests = stats_alloc(MAX_THREAD_RATE_S);
     thread *threads     = zcalloc(cfg.threads * sizeof(thread));
 
+    statistics.epochs = cfg.duration * (1000 / RECORD_INTERVAL_MS);
+    statistics.req_count = zcalloc(sizeof(uint64_t) * statistics.epochs);
+
     lua_State *L = script_create(cfg.script, url, headers);
     if (!script_resolve(L, host, service)) {
         char *msg = strerror(errno);
@@ -120,6 +133,11 @@ int main(int argc, char **argv) {
             }
         }
 
+        t->id = i;
+        t->epoch = 0;
+
+        printf("Starting thread %ld...\n", i);
+
         if (!t->loop || pthread_create(&t->thread, NULL, &thread_main, t)) {
             char *msg = strerror(errno);
             fprintf(stderr, "unable to create thread %"PRIu64": %s\n", i, msg);
@@ -137,6 +155,10 @@ int main(int argc, char **argv) {
     char *time = format_time_s(cfg.duration);
     printf("Running %s test @ %s\n", time, url);
     printf("  %"PRIu64" threads and %"PRIu64" connections\n", cfg.threads, cfg.connections);
+
+    if (cfg.thread_timeseries) {
+        printf("\nTHREAD  |  EPOCH  |  REQUESTS\n");
+    }
 
     uint64_t start    = time_us();
     uint64_t complete = 0;
@@ -195,6 +217,31 @@ int main(int argc, char **argv) {
         script_errors(L, &errors);
         script_done(L, statistics.latency, statistics.requests);
     }
+
+    if (cfg.timeseries) {
+        printf("Request counts time series (interval = %dms) \n", RECORD_INTERVAL_MS);
+
+        for (uint64_t i = 0; i < statistics.epochs; i++) {
+            printf("%ld\n", statistics.req_count[i]);
+        }
+    }
+
+    if (cfg.histogram) {
+        printf("Latency histogram (bin width = 1us)\n");
+
+        uint64_t lastIdx = cfg.timeout*1000 - 1;
+        for (; lastIdx > 0; lastIdx--) {
+            if (statistics.latency->data[lastIdx] > 0) {
+                break;
+            }
+        }
+
+        for (uint64_t i = 0; i <= lastIdx; i++) {
+            printf("%ld\n", statistics.latency->data[i]);
+        }
+    }
+
+    zfree(statistics.req_count);
 
     return 0;
 }
@@ -273,6 +320,16 @@ static int reconnect_socket(thread *thread, connection *c) {
 static int record_rate(aeEventLoop *loop, long long id, void *data) {
     thread *thread = data;
 
+    if (cfg.thread_timeseries && thread->epoch < statistics.epochs) {
+        printf("%6ld    %6ld    %9ld\n", thread->id, thread->epoch, thread->requests);
+    }
+
+    if (thread->epoch < statistics.epochs) {
+        __sync_fetch_and_add(&statistics.req_count[thread->epoch], thread->requests);
+    }
+
+    thread->epoch++;
+
     if (thread->requests > 0) {
         uint64_t elapsed_ms = (time_us() - thread->start) / 1000;
         uint64_t requests = (thread->requests / (double) elapsed_ms) * 1000;
@@ -283,7 +340,7 @@ static int record_rate(aeEventLoop *loop, long long id, void *data) {
         thread->start    = time_us();
     }
 
-    if (stop) aeStop(loop);
+    if (stop || thread->epoch == statistics.epochs) aeStop(loop);
 
     return RECORD_INTERVAL_MS;
 }
@@ -476,6 +533,9 @@ static struct option longopts[] = {
     { "timeout",     required_argument, NULL, 'T' },
     { "help",        no_argument,       NULL, 'h' },
     { "version",     no_argument,       NULL, 'v' },
+    { "histogram",   no_argument,       NULL, 'G' },
+    { "timeseries",  no_argument,       NULL, 'X' },
+    { "thread-timeseries", no_argument,       NULL, 'D' },
     { NULL,          0,                 NULL,  0  }
 };
 
@@ -488,6 +548,9 @@ static int parse_args(struct config *cfg, char **url, struct http_parser_url *pa
     cfg->connections = 10;
     cfg->duration    = 10;
     cfg->timeout     = SOCKET_TIMEOUT_MS;
+    cfg->histogram   = false;
+    cfg->timeseries  = false;
+    cfg->thread_timeseries  = false;
 
     while ((c = getopt_long(argc, argv, "t:c:d:s:H:T:Lrv?", longopts, NULL)) != -1) {
         switch (c) {
@@ -514,8 +577,17 @@ static int parse_args(struct config *cfg, char **url, struct http_parser_url *pa
                 cfg->timeout *= 1000;
                 break;
             case 'v':
-                printf("wrk %s [%s] ", VERSION, aeGetApiName());
-                printf("Copyright (C) 2012 Will Glozer\n");
+                printf("wrx %s [%s] ", VERSION, aeGetApiName());
+                printf("A fork of wkr - originally developed by Will Glozer\n");
+                break;
+            case 'G':
+                cfg->histogram = true;
+                break;
+            case 'X':
+                cfg->timeseries = true;
+                break;
+            case 'D':
+                cfg->thread_timeseries = true;
                 break;
             case 'h':
             case '?':
@@ -573,12 +645,12 @@ static void print_stats(char *name, stats *stats, char *(*fmt)(long double)) {
 }
 
 static void print_stats_latency(stats *stats) {
-    long double percentiles[] = { 50.0, 75.0, 90.0, 99.0 };
+    long double percentiles[] = { 50.0, 75.0, 90.0, 99.0, 99.9, 99.99 };
     printf("  Latency Distribution\n");
     for (size_t i = 0; i < sizeof(percentiles) / sizeof(long double); i++) {
         long double p = percentiles[i];
         uint64_t n = stats_percentile(stats, p);
-        printf("%7.0Lf%%", p);
+        printf("%7.2Lf%%", p);
         print_units(n, format_time_us, 10);
         printf("\n");
     }

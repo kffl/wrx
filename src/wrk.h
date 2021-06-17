@@ -20,7 +20,7 @@
 
 #define MAX_THREAD_RATE_S   10000000
 #define SOCKET_TIMEOUT_MS   2000
-#define RECORD_INTERVAL_MS  100
+#define RECORD_INTERVAL_MS  250
 
 extern const char *VERSION;
 
@@ -33,6 +33,8 @@ typedef struct {
     uint64_t requests;
     uint64_t bytes;
     uint64_t start;
+    uint64_t id;
+    uint64_t epoch;
     lua_State *L;
     errors errors;
     struct connection *cs;

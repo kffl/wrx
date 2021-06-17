@@ -19,7 +19,7 @@ endif
 
 SRC  := wrk.c net.c ssl.c aprintf.c stats.c script.c units.c \
 		ae.c zmalloc.c http_parser.c
-BIN  := wrk
+BIN  := wrx
 VER  ?= $(shell git describe --tags --always --dirty)
 
 ODIR := obj
